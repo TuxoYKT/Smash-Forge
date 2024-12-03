@@ -10,7 +10,7 @@ using System.Windows.Forms;
 
 namespace SmashForge
 {
-    class Collada
+    public class Collada
     {
         public Collada()
         {
