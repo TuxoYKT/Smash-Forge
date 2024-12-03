@@ -8,13 +8,15 @@ using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using MoonSharp.Interpreter;
-using System;
-using System.Collections.Generic;
+using System.Collections.Concurrent;
+using System.Threading;
+using System.IO.Compression;
 
 namespace WanganTools
 {
     internal class Program
     {
+        // Your existing ModelSection and FileEntry classes remain the same
         public class ModelSection
         {
             public int SectionId { get; set; }
@@ -89,34 +91,15 @@ namespace WanganTools
                         BinPath = sectionData.Table.Get("BIN").String
                     };
 
-                    // Parse LONG files
                     ParseFileEntries(sectionData.Table, "LONG", section.LongFiles);
-
-                    // Parse NEAR files
                     ParseFileEntries(sectionData.Table, "NEAR", section.NearFiles);
-
-                    // Parse LODM files
                     ParseFileEntries(sectionData.Table, "LODM", section.LodmFiles);
-
-                    // Parse ROAD files
                     ParseFileEntries(sectionData.Table, "ROAD", section.RoadFiles);
-
-                    // Parse ONRD files
                     ParseFileEntries(sectionData.Table, "ONRD", section.OnrdFiles);
-
-                    // Parse BACK files
                     ParseFileEntries(sectionData.Table, "BACK", section.BackFiles);
-
-                    // Parse CAST files
                     ParseFileEntries(sectionData.Table, "CAST", section.CastFiles);
-
-                    // Parse REFC files
                     ParseFileEntries(sectionData.Table, "REFC", section.RefcFiles);
-
-                    // Parse REFR files
                     ParseFileEntries(sectionData.Table, "REFR", section.RefrFiles);
-
-                    // Parse RFBG files
                     ParseFileEntries(sectionData.Table, "RFBG", section.RfbgFiles);
 
                     results.Add(section);
@@ -154,112 +137,217 @@ namespace WanganTools
             }
         }
 
-        static byte[] ExtractBytes(string filePath, long offset, int length)
+        public class BinaryCache : IDisposable
         {
-            // Validate input
-            if (offset < 0 || length <= 0)
+            private byte[] decompressedData;
+            private readonly string filePath;
+            private readonly bool isCompressed;
+            private bool isDisposed;
+
+            public BinaryCache(string filePath)
             {
-                throw new ArgumentException("Offset must be non-negative and length must be greater than zero.");
+                this.filePath = filePath;
+                this.isCompressed = IsGZipCompressed(filePath);
+                LoadFile();
             }
 
-            using (FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read))
+            private static bool IsGZipCompressed(string filePath)
             {
-                // Ensure the offset and length are within file bounds
-                if (offset + length > fs.Length)
+                try
                 {
+                    using (FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read))
+                    {
+                        if (fs.Length < 2)
+                            return false;
+
+                        byte[] signature = new byte[2];
+                        fs.Read(signature, 0, 2);
+
+                        return signature[0] == 0x1F && signature[1] == 0x8B;
+                    }
+                }
+                catch (Exception)
+                {
+                    return false;
+                }
+            }
+
+            private void LoadFile()
+            {
+                if (isCompressed)
+                {
+                    using (FileStream compressedFileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read))
+                    using (GZipStream decompressionStream = new GZipStream(compressedFileStream, CompressionMode.Decompress))
+                    using (MemoryStream resultStream = new MemoryStream())
+                    {
+                        decompressionStream.CopyTo(resultStream);
+                        decompressedData = resultStream.ToArray();
+                    }
+                    Console.WriteLine($"Loaded and decompressed file: {filePath}, size: {decompressedData.Length:N0} bytes");
+                }
+                else
+                {
+                    decompressedData = File.ReadAllBytes(filePath);
+                    Console.WriteLine($"Loaded file: {filePath}, size: {decompressedData.Length:N0} bytes");
+                }
+            }
+
+            public byte[] GetBytes(long offset, int length)
+            {
+                if (isDisposed)
+                    throw new ObjectDisposedException(nameof(BinaryCache));
+
+                if (offset < 0 || length <= 0)
+                    throw new ArgumentException("Offset must be non-negative and length must be greater than zero.");
+
+                if (offset + length > decompressedData.Length)
                     throw new ArgumentOutOfRangeException("The specified offset and length exceed the file size.");
-                }
 
-                // Seek to the desired offset
-                fs.Seek(offset, SeekOrigin.Begin);
+                byte[] result = new byte[length];
+                Array.Copy(decompressedData, offset, result, 0, length);
+                return result;
+            }
 
-                // Read the specified number of bytes
-                byte[] buffer = new byte[length];
-                int bytesRead = fs.Read(buffer, 0, length);
-
-                // Ensure we read the expected number of bytes
-                if (bytesRead != length)
+            public void Dispose()
+            {
+                if (!isDisposed)
                 {
-                    throw new IOException("Failed to read the specified number of bytes.");
+                    decompressedData = null;
+                    isDisposed = true;
+                    GC.SuppressFinalize(this);
+                }
+            }
+        }
+
+        static void ProcessFileEntry(FileEntry file, BinaryCache binaryCache, string outputDir)
+        {
+            try
+            {
+                Console.WriteLine($"Processing {file.Name} at {file.StartAddress}, length: {file.Length}");
+
+                byte[] bytes = binaryCache.GetBytes(file.StartAddress, (int)file.Length);
+                string outputPath = Path.Combine(outputDir, file.Name + ".nud");
+
+                Directory.CreateDirectory(Path.GetDirectoryName(outputPath));
+                File.WriteAllBytes(outputPath, bytes);
+
+                ModelContainer modelContainer = new ModelContainer();
+                modelContainer.NUD = new Nud(outputPath);
+
+                if (modelContainer.NUD != null)
+                {
+                    string name = file.Name;
+
+                    modelContainer.NUD.MergePoly();
+                    Nud nud = modelContainer.NUD;
+                    foreach (Nud.Mesh mesh in nud.Nodes)
+                    {
+                        if (!string.IsNullOrEmpty(mesh.Name))
+                        {
+                            name = mesh.Name;
+                        }
+                    }
+
+                    string daePath = Path.Combine(outputDir, name + ".dae");
+                    Collada.Save(daePath, modelContainer);
+                    Console.WriteLine($"Saved {daePath}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error processing {file.Name}: {ex.Message}");
+            }
+        }
+
+        static void ProcessModelSection(ModelSection section, string basePath)
+        {
+            var binPath = Path.Combine(Path.GetDirectoryName(basePath), "bin", Path.GetFileName(section.BinPath));
+            var outputDir = Path.Combine(Path.GetDirectoryName(basePath), "extracted_files", $"section_{section.SectionId}");
+
+            // Check for .gz version first
+            string gzipPath = binPath;
+            string actualBinPath;
+
+            if (File.Exists(gzipPath))
+            {
+                actualBinPath = gzipPath;
+                Console.WriteLine($"Found compressed bin file: {gzipPath}");
+            }
+            else if (File.Exists(binPath))
+            {
+                actualBinPath = binPath;
+                Console.WriteLine($"Found bin file: {binPath}");
+            }
+            else
+            {
+                Console.WriteLine($"Error: Neither {binPath} nor {gzipPath} found.");
+                return;
+            }
+
+            Directory.CreateDirectory(outputDir);
+            Console.WriteLine($"\nProcessing Section {section.SectionId}:");
+            Console.WriteLine($"Bin: {section.BinPath}");
+
+            // Create binary cache for this section
+            using (var binaryCache = new BinaryCache(actualBinPath))
+            {
+                var fileListProperties = typeof(ModelSection)
+                    .GetProperties()
+                    .Where(p => p.PropertyType == typeof(List<FileEntry>));
+
+                foreach (var listProperty in fileListProperties)
+                {
+                    var files = (List<FileEntry>)listProperty.GetValue(section);
+                    if (files == null || !files.Any()) continue;
+
+                    var listName = listProperty.Name.Replace("Files", "");
+                    Console.WriteLine($"Processing {listName} Files:");
+
+                    foreach (var file in files)
+                    {
+                        ProcessFileEntry(file, binaryCache, outputDir);
+                    }
+                }
+            }
+        }
+
+        static async Task MainAsync(string[] args)
+        {
+            try
+            {
+                string luaPath = args.Length > 0 ? args[0] : throw new ArgumentException("Lua file path is required as an argument.");
+                string luaContent = File.ReadAllText(luaPath);
+                var parser = new LuaModelParser();
+
+                var textures = parser.ParseTextureList(luaContent);
+                foreach (var texture in textures)
+                {
+                    Console.WriteLine($"Texture: {texture}");
                 }
 
-                return buffer;
+                var models = parser.ParseModelList(luaContent);
+
+                // Process sections in parallel
+                var tasks = models.Select(section =>
+                    Task.Run(() => ProcessModelSection(section, luaPath))
+                ).ToList();
+
+                await Task.WhenAll(tasks);
+
+                Console.WriteLine("Done! Press any key to continue...");
+                Console.ReadKey();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"An error occurred: {ex.Message}");
+                Console.WriteLine(ex.StackTrace);
+                Console.ReadKey();
             }
         }
 
         static void Main(string[] args)
         {
-            //Read .lua file
-            string luaPath = "D:\\wangan\\LOADLIST_A_TOKYO_NGT_NML_WANGAN.lua";
-            string luaContent = File.ReadAllText(luaPath);
-            var parser = new LuaModelParser();
-
-            // Parse textures
-            var textures = parser.ParseTextureList(luaContent);
-            foreach (var texture in textures)
-            {
-                Console.WriteLine($"Texture: {texture}");
-            }
-
-            // Parse models
-            var models = parser.ParseModelList(luaContent);
-            foreach (var section in models)
-            {
-                Console.WriteLine($"\nSection {section.SectionId}:");
-                Console.WriteLine($"Bin: {section.BinPath}");
-
-                var binPath = Path.GetDirectoryName(luaPath) + "\\bin\\" + Path.GetFileNameWithoutExtension(section.BinPath);
-                var fileListProperties = typeof(ModelSection)
-                    .GetProperties()
-                    .Where(p => p.PropertyType == typeof(List<FileEntry>));
-
-                // Process each list of files
-                foreach (var listProperty in fileListProperties)
-                {
-                    var files = (List<FileEntry>)listProperty.GetValue(section);
-
-                    // Skip if the list is empty
-                    if (files == null || !files.Any()) continue;
-
-                    var listName = listProperty.Name.Replace("Files", ""); // Remove "Files" suffix for display
-
-                    Console.WriteLine($"{listName} Files:");
-                    foreach (var file in files)
-                    {
-                        Console.WriteLine($"  {file.Name} at {file.StartAddress}, length: {file.Length}");
-                        var bytes = ExtractBytes(binPath, file.StartAddress, (int)file.Length);
-                        var outputDir = Path.GetDirectoryName(luaPath) + "\\extracted_files\\";
-                        if (!Directory.Exists(outputDir))
-                        {
-                            Directory.CreateDirectory(outputDir);
-                        }
-                        File.WriteAllBytes(outputDir + file.Name + ".nud", bytes);
-
-                        ModelContainer modelContainer = new ModelContainer();
-                        modelContainer.NUD = new Nud(outputDir + file.Name + ".nud");
-
-                        if (modelContainer.NUD != null)
-                        {
-                            string name = file.Name;
-
-                            modelContainer.NUD.MergePoly();
-                            Nud nud = modelContainer.NUD;
-                            foreach (Nud.Mesh mesh in nud.Nodes)
-                            {
-                                if (!string.IsNullOrEmpty(mesh.Name))
-                                {
-                                    name = mesh.Name;
-                                }
-                            }
-
-                            Collada.Save(Path.Combine(outputDir, name + ".dae"), modelContainer);
-                            Console.WriteLine("Saved " + Path.Combine(outputDir, name + ".dae"));
-                        }
-                    }
-                }
-            }
-            Console.WriteLine("Done! Press any key to continue...");
-            Console.ReadKey();
+            MainAsync(args).GetAwaiter().GetResult();
         }
     }
 }
